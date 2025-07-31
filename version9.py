@@ -1,0 +1,603 @@
+# Version 8 EDITING
+
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+import numpy as np
+from scipy.ndimage import gaussian_filter1d
+import os
+from copy import deepcopy
+import warnings
+import contextlib
+import sys
+import csv
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+class SilentContext:
+    def __enter__(self):
+        self._stdout = sys.stdout
+        sys.stdout = open(os.devnull, 'w')
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.stdout = self._stdout
+
+class SupernovaLightCurveFitter:
+    def __init__(self, file_path, filename):
+        self.file_path = file_path
+        self.filename = filename
+        self.x_array = None
+        self.y_array = None
+        self.error_array = None
+        self.t2_fit = None
+        self.csvfilename = r"C:\Users\sansi\Documents\School 2025\Adopt-a-Scientist\Final Project Files\Data on Fits\testingdata.csv"
+        # self.filetosave = r"C:\Users\sansi\Documents\School 2025\Adopt-a-Scientist\Final Project Files\Final Plots"
+        self.filetosave = r"C:\Users\sansi\Documents\School 2025\Adopt-a-Scientist\Final Project Files\Final Plots\Testing"
+        self.load_and_validate_data()
+
+    def load_and_validate_data(self):
+        data = np.loadtxt(self.file_path)
+        x_array = data[:, 0]
+        y_array = data[:, 1]
+        y_array -= np.nanmedian(y_array[:100])
+        error_array = data[:, 2]
+
+        valid_indices = np.isfinite(x_array) & np.isfinite(y_array) & np.isfinite(error_array)
+        self.x_array = x_array[valid_indices]
+        self.y_array = y_array[valid_indices]
+        self.error_array = error_array[valid_indices]
+        self.supernova_name = f"SN-{filename[:-8]}"
+
+    def detect_t0_robust(self, bx, by, be, min_rise_duration=5, sigma=2, baseline_fraction=0.2):
+        y_smooth = gaussian_filter1d(deepcopy(by), sigma=sigma)
+
+        baseline_end = int(baseline_fraction * len(by))
+        baseline_mean = np.mean(y_smooth[:baseline_end])
+        baseline_std = np.std(y_smooth[:baseline_end])
+        threshold = baseline_mean + sigma * baseline_std
+
+        for i in range(baseline_end, len(by) - min_rise_duration):
+            segment = y_smooth[i:i + min_rise_duration]
+            if np.all(segment > threshold) and np.mean(np.diff(segment)) > 0:
+                return bx[i]
+        return None  # Explicitly signal failure
+
+    def fit_power_law_with_robust_t0(self, bx, by, be):
+        # Filter out NaNs and infs
+        mask = np.isfinite(bx) & np.isfinite(by) & np.isfinite(be)
+        bx = bx[mask]
+        by = by[mask]
+        be = be[mask]
+
+        if len(bx) < 5:
+            print("Not enough valid binned points for fitting.")
+            return None, None, None
+        
+        t0_guess = self.detect_t0_robust(bx, by, be)
+        print(f"Robust t0 detected at: {t0_guess}")
+
+        initial_guess = [1.0, t0_guess, 2.0, 0]
+        bounds = ([0, t0_guess - 2, 1, -0.1], [np.inf, t0_guess + 2, 3, 0.5])
+
+        try:
+            popt, pcov = curve_fit(self.power_law_offset, bx, by, sigma=be, p0=initial_guess, bounds=bounds)
+            A, t0, b, C = popt
+            # print(f'A: {A:.4f}\nt0: {t0:.4f}\nb: {b:.4f}\nC: {C:.4f}')
+            return popt, pcov, t0_guess
+        except RuntimeError as e:
+            print(f"Fit failed: {e}")
+            return None, None, t0_guess
+
+    def piecewise_model(self, t, A, t0, b, C):
+        try:
+            q = np.where(t < t0, C, A * (t - t0)**b + C)
+        except RuntimeWarning:
+            q = np.where(t < t0, C, A * (t - t0)**b + C)
+        return q
+
+    def fit_piecewise_t0(self, t, y, e):
+        mask = np.isfinite(t) & np.isfinite(y) & np.isfinite(e)
+        t = t[mask]
+        y = y[mask]
+        e = e[mask]
+
+        # Basic guess
+        A_guess = np.max(y) - np.min(y)
+        t0_guess = t[np.argmax(np.gradient(y))]
+        b_guess = 2
+        C_guess = np.min(y)
+
+        p0 = [A_guess, t0_guess, b_guess, C_guess]
+        bounds = (
+            [0, t[0], 0.5, -np.inf],     # Lower bounds
+            [np.inf, t[-1], 5, np.inf]   # Upper bounds
+        )
+
+        try:
+            popt, pcov = curve_fit(self.piecewise_model, t, y, sigma=e, p0=p0, bounds=bounds)
+            A, t0, b, C = popt
+            print(f"[Piecewise] t0: {t0:.4f}, A: {A:.4f}, b: {b:.4f}, C: {C:.4f}")
+            return popt, pcov
+        except RuntimeError as err:
+            print(f"Piecewise fit failed: {err}")
+            return None, None
+
+    def power_law_offset_fixC(self, x, A, t0, b):
+        C = self.c_value
+        q = A * np.power(np.maximum(x - t0, 0), b) + C
+        return q
+    
+    def power_law_offset(self, x, A, t0, b, C):
+        q = A * np.power(np.maximum(x - t0, 0), b) + C
+        return q
+
+    def bin_data(self, lc=None, time_bin=6/24, frames=None):
+        if lc is None:
+            lc = np.vstack([self.x_array, self.y_array, self.error_array])
+        else:
+            lc = np.array(lc)
+            if lc.shape[0] > lc.shape[1]:
+                lc = lc.T
+        flux = lc[1]
+        try:
+            err = lc[2]
+        except Exception:
+            err = deepcopy(lc[1]) * np.nan
+        t = lc[0]
+
+        if time_bin is None:
+            bin_size = int(frames)
+            lc_binned = []
+            x = []
+            e = []
+            for i in range(int(len(flux) / bin_size)):
+                segment = flux[i * bin_size:(i + 1) * bin_size]
+                segment_err = err[i * bin_size:(i + 1) * bin_size]
+                if np.isnan(segment).all():
+                    lc_binned.append(np.nan)
+                    e.append(np.nan)
+                    x.append(int(i * bin_size + (bin_size / 2)))
+                else:
+                    lc_binned.append(np.nanmedian(segment))
+                    # e.append(np.nanmedian(segment_err))
+                    e.append(np.nanstd(segment))
+                    x.append(int(i * bin_size + (bin_size / 2)))
+            binlc = np.array([t[x], lc_binned, e])
+        else:
+            points = np.arange(t[0] + time_bin * .5, t[-1], time_bin)
+            time_inds = abs(points[:, np.newaxis] - t[np.newaxis, :]) <= time_bin / 2
+            l = []
+            e = []
+            for i in range(len(points)):
+                if np.any(time_inds[i]):
+                    l.append(np.nanmedian(flux[time_inds[i]]))
+                    e.append(np.nanmedian(err[time_inds[i]]))
+                else:
+                    l.append(np.nan)
+                    e.append(np.nan)
+            l = np.array(l)
+            e = np.array(e)
+            binlc = np.array([points, l, e])
+        return binlc
+
+    def second_fitting(self, bx, by, be):
+        if self.t2_fit is None:
+            print("t2_fit is None, cannot proceed with second fitting.")
+            return None, None, None, None
+
+        cutoff_time = self.t2_fit
+        x_upper_limit = cutoff_time + 7
+
+        mask = (bx >= cutoff_time) & (bx <= x_upper_limit)
+        x_array2 = bx[mask]
+        y_array2 = by[mask]
+        error_array2 = be[mask]
+
+        x_array3 = bx
+        y_array3 = by
+        error_array3 = be
+
+        # Filter invalid points
+        valid_indices = np.isfinite(x_array2) & np.isfinite(y_array2) & np.isfinite(error_array2)
+        x_array2 = x_array2[valid_indices]
+        y_array2 = y_array2[valid_indices]
+        error_array2 = error_array2[valid_indices]
+
+        t0_guess = np.min(x_array2) - 0.5
+        t0_guess3 = np.min(x_array3) - 0.5
+
+        t0_lower = t0_guess - 5
+        t0_upper = t0_guess + 1
+
+        if x_array2.size == 0:
+            print("Warning: no valid data points in decay segment.")
+            return None, None, None, None
+
+        if x_array3.size == 0:
+            print("Warning: no valid data points in decay segment.")
+            return None, None, None, None
+        
+        A_guess = np.max(y_array2) - np.min(y_array2)
+        A_guess3 = np.max(y_array3) - np.min(y_array3)
+
+        t0_lower3 = np.min(x_array3) - 5
+        t0_upper3 = np.max(x_array3)
+
+        if not np.isfinite(t0_lower):
+            t0_lower = np.min(bx) - 5
+        if not np.isfinite(t0_upper):
+            t0_upper = np.max(bx)
+
+        b_guess = 2
+        
+        C_guess = self.c_value
+        C_guess3 = np.min(y_array3)
+
+        if not (t0_lower <= t0_guess <= t0_upper):
+            print("t0_guess is not within the bounds of t0_lower and t0_upper")
+            print(f"t0_lower: {t0_lower}")
+            print(f"t0_upper: {t0_upper}")
+            print(f"t0_guess: {t0_guess}")
+
+        if not (t0_lower3 <= t0_guess3 <= t0_upper3):
+            print("t0_guess is not within the bounds of t0_lower and t0_upper")
+            print(f"t0_lower: {t0_lower3}")
+            print(f"t0_upper: {t0_upper3}")
+            print(f"t0_guess: {t0_guess3}")
+
+        p02 = [A_guess, t0_guess, b_guess, C_guess]
+        p03 = [A_guess3, t0_guess3, b_guess, C_guess3]
+
+        bounds2 = (
+            [0.1 * A_guess, t0_lower, 1, C_guess - 0.1],
+            [10 * A_guess, t0_upper, 5, C_guess + 0.1]
+        )
+        bounds3 = (
+            [0.1 * A_guess3, t0_lower3, 0.1, -np.inf],
+            [10 * A_guess3, t0_upper3, 5, np.inf]
+        )
+
+        # print(f"Initial guess p02: {p02}")
+        # print(f"Bounds bounds2: {bounds2}")
+        # print('---------------------------')
+        # print(f"Initial guess p03: {p02}")
+        # print(f"Bounds bounds3: {bounds2}")
+
+        popt2 = None
+        popt3 = None
+
+        try:
+            popt2, pcov2 = curve_fit(
+                self.power_law_offset,
+                x_array2,
+                y_array2,
+                sigma=error_array2,
+                absolute_sigma=True,
+                p0=p02,
+                bounds=bounds2,
+                maxfev=5000,
+                method='trf'
+            )
+            self.A_fit2, self.t0_fit2, self.b_fit2, self.C_fit2 = popt2
+            print(f"Second fit parameters:\n A = {self.A_fit2:.4f}\n t0 = {self.t0_fit2:.4f}\n b = {self.b_fit2:.4f}\n C = {self.C_fit2:.4f}")
+        except ValueError as e:
+            print(f"Fit failed (ValueError): {e}")
+        except RuntimeError as e:
+            print(f"Fit failed (RuntimeError): {e}")
+        except Exception as e:
+            print(f"Fit failed (General Error): {e}")
+            print(f"Exception Type: {type(e).__name__}")
+            print(f"Exception Arguments: {e.args}")
+
+        return popt2, x_array2, y_array2, error_array2, pcov2
+
+    def fit_power_law_offset(self, bx, by, be):
+        """
+        Fit the offset power-law model: A*(t-t0)^b + C to the binned data.
+        Returns best-fit parameters and covariance.
+        """
+        # Filter out invalid data
+        mask = np.isfinite(bx) & np.isfinite(by) & np.isfinite(be)
+        bx = bx[mask]
+        by = by[mask]
+        be = be[mask]
+        if len(bx) < 5:
+            print("Not enough valid binned points for offset model fitting.")
+            return None, None
+
+        # Initial guesses
+        t0_guess = self.detect_t0_robust(bx, by, be)
+        A_guess = (np.max(by) - np.min(by)) / (np.max(bx) - t0_guess) ** 2
+        if not np.isfinite(A_guess) or A_guess <= 0:
+            A_guess = 1.0
+        b_guess = 2.0
+        C_guess = np.min(by)
+        initial_guess = [A_guess, t0_guess, b_guess, C_guess]
+
+        # Bounds
+        bounds = (
+            [0, t0_guess - 2, 1.0, -np.inf],         # Lower: A, t0, b, C
+            [10 * A_guess, t0_guess + 2, 10, np.inf] # Upper: A, t0, b, C
+        )
+
+        try:
+            popt, pcov = curve_fit(
+                self.power_law_offset, bx, by, sigma=be,
+                p0=initial_guess, bounds=bounds, maxfev=5000
+            )
+            return popt, bx, by, be
+        except Exception as e:
+            print(f"Offset model fit failed: {e}")
+            return None, None
+
+    def find_pcov(self, time_bin=6/24):
+        binlc = self.bin_data(time_bin=time_bin)
+        bx, by, be = binlc
+
+        with SilentContext(): popt, pcov, t0_guess = self.fit_power_law_with_robust_t0(bx, by, be)
+
+
+        if popt is not None:
+            self.t2_fit = t0_guess
+            with SilentContext(): popt2, x_array2, y_array2, error_array2, pcov2 = self.second_fitting(bx, by, be)
+
+        squarerooted = np.sqrt(pcov2)
+        diag = np.diag(squarerooted)
+        a_pcov, t0_pcov, b_pcov, c_pcov = diag
+        return a_pcov, t0_pcov, b_pcov, c_pcov
+
+    def r_squared(self, y_data, y_fit):
+        ss_res = np.nansum((y_data - y_fit) ** 2)
+        ss_tot = np.nansum((y_data - np.nanmean(y_data)) ** 2)
+        if ss_tot == 0:
+            return np.nan  # or some other suitable value
+        return 1 - (ss_res / ss_tot)
+
+    def fit_uncertainty_score(self, popt, pcov):
+        if pcov is None or not np.all(np.isfinite(pcov)):
+            return np.inf
+        # return np.sqrt(np.trace(pcov)) / np.linalg.norm(popt)
+        return np.sqrt(np.diag(pcov))
+
+    def compute_residual_std(self, F_obs, F_model, F_err, dof=None):
+        """
+        Computes the standard deviation of residuals and (optionally) the reduced chi-squared.
+
+        Parameters:
+        - F_obs : array-like
+            Observed flux values (e.g., in counts/s, magnitudes, etc.).
+        - F_model : array-like
+            Model-predicted flux values at the same times.
+        - F_err : array-like, optional
+            Uncertainties in the observed flux values. Required for chi-squared.
+        - dof : int, optional
+            Degrees of freedom (typically: number of data points - number of model parameters).
+
+        Returns:
+        - std_residuals : float
+            Standard deviation of the residuals.
+        - chi2_red : float or None
+            Reduced chi-squared if F_err and dof are provided; otherwise None.
+        """
+        F_obs = np.array(F_obs)
+        F_model = np.array(F_model)
+
+        print("F_err contains zero:", np.any(F_err == 0))
+        
+        # Residuals
+        residuals = F_obs - F_model
+        
+        # Standard deviation of residuals
+        std_residuals = np.sqrt(np.mean(residuals**2))
+        
+        # Reduced chi-squared (optional)
+        chi2_red = None
+        if F_err is not None and dof is not None:
+            F_err = np.array(F_err)
+            chi2 = np.sum((residuals / F_err) ** 2)
+            chi2_red = chi2 / dof
+        
+        return std_residuals, chi2_red
+
+    def compute_residual_metrics(self, F_obs, F_model, F_err, dof=None):
+        """Calculate residual statistics and goodness-of-fit metrics.
+        
+        Parameters:
+        F_obs (array): Observed flux values
+        F_model (array): Model-predicted flux values
+        F_err (array): Flux measurement uncertainties
+        dof (int): Degrees of freedom (n_obs - n_params)
+        
+        Returns:
+        dict: Dictionary containing residual statistics
+        """
+        residuals = F_obs - F_model
+        
+        metrics = {
+            'std_residuals': np.sqrt(np.nanmean(residuals**2)),
+            'mad': np.nanmedian(np.abs(residuals - np.nanmedian(residuals))),
+            'max_residual': np.nanmax(np.abs(residuals)),
+        }
+        
+        if F_err is not None and dof is not None:
+            chi2 = np.nansum((residuals/F_err)**2)
+            metrics.update({
+                'chi2': chi2,
+                'chi2_red': chi2/dof,
+                'n_sigma': residuals/F_err
+            })
+        
+        return metrics
+    
+    def extending_curve(self, x, y, e):
+        extended_list_y = []
+        extended_list_x = []
+        extended_list_e = []
+        for i in range(int(x[0]) - 5000, int(x[0])):
+            extended_list_y.append(y[0])
+            extended_list_x.append(i)
+            extended_list_e.append(0)
+        for j in x:
+            extended_list_x.append(j)
+        for k in y:
+            extended_list_y.append(k)
+        for l in e:
+            extended_list_e.append(l)
+        return np.array(extended_list_x), np.array(extended_list_y), np.array(extended_list_e)
+
+    def savetocsv(self, fit1, fit2, uncertainty):
+        filename = self.csvfilename
+        name = self.filename  # This is the supernova name or identifier
+        # Unpack fit values
+        a1, t1, b1, c1 = fit1
+        a2, t2, b2, c2 = fit2
+        # Ensure the directory exists
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        # Check if file already exists to determine if headers should be written
+        write_header = not os.path.exists(filename)
+        with open(filename, 'a', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            if write_header:
+                writer.writerow([
+                    "Supernova", 
+                    "Fit1_A", "Fit1_t0", "Fit1_b", "Fit1_C",
+                    "Fit2_A", "Fit2_t0", "Fit2_b", "Fit2_C",
+                    "Uncertainty"
+                ])
+            writer.writerow([
+                name, 
+                f"{a1:.6f}", f"{t1:.6f}", f"{b1:.6f}", f"{c1:.6f}",
+                f"{a2:.6f}", f"{t2:.6f}", f"{b2:.6f}", f"{c2:.6f}",
+                f"{uncertainty:.6f}"
+            ])
+
+    def fit_and_plot(self, time_bin=6/24):
+        binlc = self.bin_data(time_bin=time_bin)
+        bx, by, be = binlc
+        with SilentContext(): popt, pcov, t0_guess = self.fit_power_law_with_robust_t0(bx, by, be)
+        t_fit = np.linspace(np.min(bx), np.max(bx), 500)
+        y_fit = self.power_law_offset(t_fit, *popt)
+        a_1, t_1, b_1, c_1 = popt
+        self.c_value = c_1
+        
+        
+        # - Second Function to Estimate T0
+        with SilentContext(): popt_pe, pcov_pe = self.fit_piecewise_t0(bx, by, be) 
+        a_pe, t_pe, b_pe, c_pe = popt_pe
+        self.t2_fit = t_1 + 1#+ 3
+        with SilentContext(): popt_test, x_array_test, y_array_test, error_array_test, pcov_test = self.second_fitting(bx, by, be)
+        cutoff_time = self.t2_fit
+        x_upper_limit = cutoff_time + 7
+
+        mask = (bx >= cutoff_time) & (bx <= x_upper_limit)
+        bx_First = bx[mask]
+        by_first = by[mask]
+        y_fit_main = self.power_law_offset(bx_First, *popt_test)
+        residuals = by_first - y_fit_main
+
+
+        if popt is not None:
+            #-Main power Law offset
+            popt2, x_array2, y_array2, error_array2, pcov2 = self.second_fitting(bx, by, be)
+            #-power law offset
+            popt3, x_array3, y_array3, error_array3 = self.fit_power_law_offset(bx, by, be)
+            t_fit_1 = np.linspace(np.min(x_array2), np.max(x_array2), 500)
+            y_fit_1 = self.power_law_offset(t_fit_1, *popt2)
+            self.r_squared_value_cutoff = self.r_squared(by_first, y_fit_main)
+
+            plt.figure(figsize=(12, 6))
+
+            plt.subplot(1, 2, 1)
+            plt.axvspan(self.t2_fit, self.t2_fit + 7, alpha=0.3, color="C1", label="Rise Section of Interest")
+            plt.axvline(t_1, color='k', linestyle='--', label=r"$t_0$ guess")
+            plt.errorbar(bx, by, yerr=be, fmt='o', markersize=3,
+                        color='blue', ecolor='gray', alpha=0.7, label="Binned Data")
+
+            if popt is not None:
+                t_fit = np.linspace(np.min(bx), np.max(bx), 500)
+                y_fit = self.power_law_offset(t_fit, *popt)
+                a, t, b, c = popt
+                print("----------R2 VALUES------------")
+                print(f"Full fit: {None}")
+                print(f"Second fit: {self.r_squared_value_cutoff}")
+            
+            if popt3 is not None:
+                t_fit = np.linspace(np.min(x_array3), np.max(x_array3), 500)
+                y_fit = self.power_law_offset(t_fit, *popt2)
+                plt.plot(t_fit, y_fit, label="Power-law Fit/Offset model (Binned)", color='C1')
+
+            plt.legend()
+            plt.xlabel("Time")
+            plt.ylabel("Flux")
+            plt.title("Power Law Fit to Supernova Light Curve (Binned)")
+
+            if popt2 is not None:
+                plt.subplot(1, 2, 2)
+                t_fit = np.linspace(np.min(x_array2), np.max(x_array2), 500)
+                A_fit2, t0_fit2, b_fit2, C_fit2 = popt2
+                y_fit = self.power_law_offset(t_fit, A_fit2, t0_fit2, b_fit2, C_fit2)
+
+                plt.errorbar(x_array2, y_array2, yerr=error_array2, fmt='o', markersize=3,
+                             label="Decay Data (Binned)", color='black', ecolor='gray')
+                plt.plot(t_fit, y_fit, label="Power-law + Offset Fit (Binned and Cut)", color='red')
+                plt.xlabel("Time")
+                plt.ylabel("Flux")
+                plt.title("Power Law Fit to Rising Segment of Light Curve (Binned)")
+                plt.legend()
+                plt.grid(True)
+                plt.tight_layout()
+                plt.show()
+
+            # --------- ADDITIONAL RESIDUAL ANALYSIS PLOTS BELOW ---------
+            # Compute fitted values and residuals for the main model
+            cutoff_time = self.t2_fit - 2
+            x_upper_limit = self.t2_fit + 7
+
+            mask = (bx >= cutoff_time) & (bx <= x_upper_limit)
+            bx_First = bx[mask]
+            by_first = by[mask]
+            be_first = be[mask]
+            y_fit_main = self.power_law_offset(bx_First, *popt2)
+            residuals = by_first - y_fit_main
+
+            pcov_score = self.fit_uncertainty_score(popt2, pcov2)
+
+            plt.figure(figsize=(14, 8))
+
+            # Residuals vs. time
+            plt.subplot(2, 2, 1)
+            plt.axvspan(self.t2_fit, self.t2_fit + 7, alpha=0.3, color="C1", label='Rising Section of Interest')
+            plt.errorbar(bx_First, residuals, yerr=be_first, fmt='o', markersize=3, color='purple', alpha=0.7)
+            plt.axhline(0, color='black', linestyle='--', linewidth=1)
+            plt.axvline(t_1, color='k', linestyle='--', label='Detected t0')
+            plt.xlabel("Time")
+            plt.ylabel("Residuals")
+            plt.title("Residuals vs. Time")
+            plt.legend()
+
+            # Residuals vs. fitted value
+            plt.subplot(2, 2, 2)
+            plt.scatter(y_fit_main, residuals, color='green', alpha=0.7)
+            plt.axhline(0, color='black', linestyle='--', linewidth=1)
+            plt.xlabel("Fitted Value")
+            plt.ylabel("Residuals")
+            plt.title("Residuals vs. Fitted Value")
+            plt.legend()
+            plt.show()
+
+#folder_path = r'C:\Users\sansi\Documents\School 2025\Adopt-a-Scientist\Final Project Files\New Files'
+folder_path = r'C:\Users\sansi\Downloads\good_lc\good_lc'
+black_list = ["2018jwi_psf.txt", "2019pdx_psf.txt", "2019rm_psf.txt"]
+# black_list = []
+for filename in os.listdir(folder_path):
+    if filename.endswith(".txt"):
+        file_path = os.path.join(folder_path, filename)
+        print("=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=")
+        print(f"Processing file: {filename}")
+        if filename in black_list:
+            print("Black Listed File Detected!")
+        else:
+            fitter = SupernovaLightCurveFitter(file_path, filename)
+            fitter.fit_and_plot()
+        print(f"Finished processing file: {filename}")
+    print("=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=\n")
